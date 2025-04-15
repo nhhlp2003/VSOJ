@@ -216,7 +216,7 @@
         <a id="navicon" href="javascript:void(0)"><i class="fa fa-bars"></i></a>
         <ul id="nav-list">
             {% if request.organization is not defined %}
-                <li class="home-nav-element"><a href="{{ url('home') }}">{% include "site-logo-fragment.html" %}</a></li>
+                <li class="home-nav-element"><a href="{{ url('home') }}" style="display: inline-flex;">{% include "site-logo-fragment.html" %}</a></li>
                 <li class="home-nav-element"><span class="nav-divider"></span></li>
                 <li class="home-menu-item"><a href="{{ url('home') }}" class="nav-home">{{ _('Home') }}</a></li>
                 {% for node in mptt_tree(nav_bar) recursive %}
@@ -248,22 +248,6 @@
                 {{ make_navbar_item('contest-list',  url('contest_list_organization', org.slug), _('Contests')) }}
                 {{ make_navbar_item('users',org.get_users_url(), _('Users')) }}
             {% endif %}
-            <li class="home-nav-element"><a href="{{ url('home') }}" style="display: inline-flex;">{% include "site-logo-fragment.html" %}</a></li>
-            <li class="home-nav-element"><span class="nav-divider"></span></li>
-            <li class="home-menu-item"><a href="{{ url('home') }}" class="nav-home">{{ _('Home') }}</a></li>
-            {% for node in mptt_tree(nav_bar) recursive %}
-                <li>
-                    <a href="{{ node.path }}" class="nav-{{ node.key }}{% if node.key in nav_tab %} active{% endif %}">
-                        {{ _(node.label) }}
-                        {% if not node.is_leaf_node() %}
-                            <div class="nav-expand">&gt;</div>
-                        {% endif %}
-                    </a>
-                    {% with children=node.get_children() %}
-                        {% if children %}<ul>{{ loop(children) }}</ul>{% endif %}
-                    {% endwith %}
-                </li>
-            {% endfor %}
         </ul>
 
         <span id="user-links">
