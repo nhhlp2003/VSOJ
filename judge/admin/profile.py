@@ -1,15 +1,80 @@
-from django.contrib import admin
+import csv
+import io
+import re
+import secrets
+import string
+
+from django.conf import settings
+from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin as OldUserAdmin
+from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
+from django.db import IntegrityError
 from django.forms import ModelForm
-from django.urls import reverse_lazy
+from django.http import HttpResponse, JsonResponse
+from django.shortcuts import redirect, render
+from django.urls import path, reverse, reverse_lazy
 from django.utils.html import format_html
 from django.utils.translation import gettext, gettext_lazy as _, ngettext
 from reversion.admin import VersionAdmin
 
 from django_ace import AceWidget
-from judge.models import Profile, WebAuthnCredential
+from judge.models import Language, Organization, Profile, WebAuthnCredential
 from judge.utils.views import NoBatchDeleteMixin
 from judge.widgets import AdminMartorWidget, AdminSelect2MultipleWidget, AdminSelect2Widget
+
+BATCH_PASSWORD_ALPHABET = string.ascii_letters + string.digits
+USERNAME_REGEX = re.compile(r'^\w+$', re.ASCII)
+USERNAME_MAX_LENGTH = 30
+FULLNAME_MAX_LENGTH = 30
+
+_bad_mail_regex_cache = None
+
+
+def _get_bad_mail_regex():
+    global _bad_mail_regex_cache
+    if _bad_mail_regex_cache is None:
+        _bad_mail_regex_cache = list(map(re.compile, settings.BAD_MAIL_PROVIDER_REGEX))
+    return _bad_mail_regex_cache
+
+
+def _validate_email_policy(email):
+    """Validate email against system policies (format, uniqueness, bad providers)."""
+    errors = []
+    if not email:
+        return errors  # email is optional
+    try:
+        validate_email(email)
+    except ValidationError:
+        errors.append('invalid email format')
+        return errors
+    if User.objects.filter(email=email).exists():
+        errors.append('email already in use')
+    domain = email.split('@')[-1].lower()
+    if domain in settings.BAD_MAIL_PROVIDERS or any(r.match(domain) for r in _get_bad_mail_regex()):
+        errors.append('email provider not allowed')
+    return errors
+
+
+def _validate_username(username):
+    """Validate username against system policies (regex, length, uniqueness)."""
+    errors = []
+    if not username:
+        errors.append('empty username')
+        return errors
+    if len(username) > USERNAME_MAX_LENGTH:
+        errors.append('username too long (max %d chars)' % USERNAME_MAX_LENGTH)
+    if not USERNAME_REGEX.match(username):
+        errors.append('username must contain only letters, numbers, or underscores')
+    if User.objects.filter(username=username).exists():
+        errors.append('username already exists')
+    return errors
+
+
+def generate_password():
+    return ''.join(secrets.choice(BATCH_PASSWORD_ALPHABET) for _ in range(8))
 
 
 class ProfileForm(ModelForm):
@@ -162,7 +227,192 @@ class ProfileAdmin(NoBatchDeleteMixin, VersionAdmin):
 
 
 class UserAdmin(OldUserAdmin):
+    change_list_template = 'admin/auth/user/change_list.html'
+
+    def get_urls(self):
+        custom_urls = [
+            path('batch-add/', self.admin_site.admin_view(self.batch_add_view), name='auth_user_batch_add'),
+            path('batch-add/template/', self.admin_site.admin_view(self.download_template_view),
+                 name='auth_user_batch_template'),
+            path('batch-add/process/', self.admin_site.admin_view(self.process_batch_view),
+                 name='auth_user_batch_process'),
+        ]
+        return custom_urls + super().get_urls()
+
     def save_model(self, request, obj, form, change):
         super().save_model(request, obj, form, change)
         if not change:
             Profile.objects.create(user=obj)
+
+    def batch_add_view(self, request):
+        context = {
+            **self.admin_site.each_context(request),
+            'title': _('Batch Add Users'),
+            'opts': self.model._meta,
+            'template_url': reverse('admin:auth_user_batch_template'),
+            'process_url': reverse('admin:auth_user_batch_process'),
+        }
+        return render(request, 'admin/auth/user/batch_add.html', context)
+
+    def download_template_view(self, request):
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="batch_users_template.csv"'
+        writer = csv.writer(response)
+        writer.writerow(['username', 'fullname', 'email', 'organization'])
+        writer.writerow(['example_user', 'Example User', 'user@example.com', 'org-slug'])
+        return response
+
+    def _error_response(self, request, msg):
+        """Return JSON error for AJAX, or redirect with message for normal requests."""
+        if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+            return JsonResponse({'error': str(msg)}, status=400)
+        messages.error(request, msg)
+        return redirect(reverse('admin:auth_user_batch_add'))
+
+    def process_batch_view(self, request):
+        if request.method != 'POST':
+            return redirect(reverse('admin:auth_user_batch_add'))
+
+        csv_file = request.FILES.get('csv_file')
+        if not csv_file:
+            return self._error_response(request, _('No CSV file was uploaded.'))
+
+        if not csv_file.name.endswith('.csv'):
+            return self._error_response(request, _('Please upload a valid CSV file.'))
+
+        try:
+            decoded_file = csv_file.read().decode('utf-8-sig')
+        except UnicodeDecodeError:
+            return self._error_response(request, _('Could not decode the CSV file. Please ensure it is UTF-8 encoded.'))
+
+        reader = csv.DictReader(io.StringIO(decoded_file))
+
+        if not reader.fieldnames or 'username' not in reader.fieldnames:
+            return self._error_response(request, _('CSV file must have a "username" column.'))
+
+        result_rows = []
+        created_count = 0
+        skipped_count = 0
+        error_count = 0
+        default_language = Language.objects.get(key=settings.DEFAULT_USER_LANGUAGE)
+
+        # Global password: if provided, validate against Django's password validators
+        global_password = request.POST.get('global_password', '').strip()
+        if global_password:
+            try:
+                validate_password(global_password)
+            except ValidationError as e:
+                return self._error_response(request, _('Password does not meet requirements: %s') %
+                                            '; '.join(e.messages))
+
+        for i, row in enumerate(reader, start=2):
+            username = row.get('username', '').strip()
+            fullname = row.get('fullname', '').strip()
+            email = row.get('email', '').strip()
+            org_slug = row.get('organization', '').strip()
+
+            # --- Validation phase ---
+            validation_errors = []
+
+            # Username validation
+            validation_errors.extend(_validate_username(username))
+
+            # Fullname validation
+            if fullname and len(fullname) > FULLNAME_MAX_LENGTH:
+                validation_errors.append('fullname too long (max %d chars)' % FULLNAME_MAX_LENGTH)
+
+            # Email validation
+            validation_errors.extend(_validate_email_policy(email))
+
+            # Organization validation (pre-check)
+            org = None
+            if org_slug:
+                try:
+                    org = Organization.objects.get(slug=org_slug)
+                    if org.slots is not None and org.member_count >= org.slots:
+                        validation_errors.append('organization "%s" is full (%d/%d)' %
+                                                 (org_slug, org.member_count, org.slots))
+                except Organization.DoesNotExist:
+                    validation_errors.append('organization "%s" not found' % org_slug)
+
+            # If any validation error, skip this row
+            if validation_errors:
+                status_msg = 'skipped: ' + '; '.join(validation_errors)
+                result_rows.append({
+                    'username': username, 'fullname': fullname, 'email': email,
+                    'organization': org_slug, 'password': '',
+                    'status': status_msg,
+                })
+                skipped_count += 1
+                continue
+
+            # --- Creation phase ---
+            password = global_password if global_password else generate_password()
+            try:
+                user = User(username=username, first_name=fullname, email=email, is_active=True)
+                user.set_password(password)
+                user.full_clean()
+                user.save()
+
+                profile = Profile(user=user, language=default_language)
+                profile.save()
+
+                if org:
+                    profile.organizations.add(org)
+                    org.on_user_changes()
+
+                created_count += 1
+                result_rows.append({
+                    'username': username, 'fullname': fullname, 'email': email,
+                    'organization': org_slug, 'password': password,
+                    'status': 'created',
+                })
+            except ValidationError as e:
+                error_count += 1
+                error_msgs = '; '.join(
+                    msg for msg_list in e.message_dict.values() for msg in msg_list
+                ) if hasattr(e, 'message_dict') else str(e)
+                result_rows.append({
+                    'username': username, 'fullname': fullname, 'email': email,
+                    'organization': org_slug, 'password': '',
+                    'status': 'error: %s' % error_msgs,
+                })
+            except IntegrityError as e:
+                error_count += 1
+                result_rows.append({
+                    'username': username, 'fullname': fullname, 'email': email,
+                    'organization': org_slug, 'password': '',
+                    'status': 'error: %s' % str(e),
+                })
+            except Exception as e:
+                error_count += 1
+                result_rows.append({
+                    'username': username, 'fullname': fullname, 'email': email,
+                    'organization': org_slug, 'password': '',
+                    'status': 'error: %s' % str(e),
+                })
+
+        if not result_rows:
+            return self._error_response(request, _('The CSV file contained no data rows.'))
+
+        # Return the result CSV with ALL rows (created, skipped, errored)
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="batch_result.csv"'
+        fieldnames = ['username', 'fullname', 'email', 'organization', 'password', 'status']
+        writer = csv.DictWriter(response, fieldnames=fieldnames)
+        writer.writeheader()
+        for row_data in result_rows:
+            writer.writerow(row_data)
+
+        # Flash messages summary
+        summary_parts = []
+        if created_count:
+            summary_parts.append(_('%d created') % created_count)
+        if skipped_count:
+            summary_parts.append(_('%d skipped') % skipped_count)
+        if error_count:
+            summary_parts.append(_('%d errors') % error_count)
+        messages.info(request, _('Batch result: %s. Check the downloaded CSV for details.') %
+                      ', '.join(summary_parts))
+
+        return response
